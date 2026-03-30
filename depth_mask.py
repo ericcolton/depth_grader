@@ -14,7 +14,11 @@ Examples:
 """
 
 import argparse
+import colorsys
+import json
+import math
 import os
+import random
 import sys
 
 import cv2
@@ -22,6 +26,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
+
+_KAPPA = 0.5522847498  # cubic bezier control point ratio for ellipse approximation
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +251,184 @@ def save_alpha_only_png(alpha_array: np.ndarray, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Orbit metadata
+# ---------------------------------------------------------------------------
+
+def _ellipse_to_bezier(
+    cx: float, cy: float, rx: float, ry: float
+) -> list[dict]:
+    """Approximate ellipse as 4 cubic Bezier curves (normalized screen coords).
+
+    t=0 starts at rightmost point (cx+rx, cy), proceeds counter-clockwise.
+    Segment boundaries: t=0, 0.25, 0.5, 0.75, 1.0.
+    """
+    k = _KAPPA
+    return [
+        # t 0.00→0.25: right → top
+        {"start": {"x": cx + rx,     "y": cy},
+         "cp1":   {"x": cx + rx,     "y": cy - ry * k},
+         "cp2":   {"x": cx + rx * k, "y": cy - ry},
+         "end":   {"x": cx,          "y": cy - ry}},
+        # t 0.25→0.50: top → left
+        {"start": {"x": cx,          "y": cy - ry},
+         "cp1":   {"x": cx - rx * k, "y": cy - ry},
+         "cp2":   {"x": cx - rx,     "y": cy - ry * k},
+         "end":   {"x": cx - rx,     "y": cy}},
+        # t 0.50→0.75: left → bottom
+        {"start": {"x": cx - rx,     "y": cy},
+         "cp1":   {"x": cx - rx,     "y": cy + ry * k},
+         "cp2":   {"x": cx - rx * k, "y": cy + ry},
+         "end":   {"x": cx,          "y": cy + ry}},
+        # t 0.75→1.00: bottom → right
+        {"start": {"x": cx,          "y": cy + ry},
+         "cp1":   {"x": cx + rx * k, "y": cy + ry},
+         "cp2":   {"x": cx + rx,     "y": cy + ry * k},
+         "end":   {"x": cx + rx,     "y": cy}},
+    ]
+
+
+def _occlusion_to_arcs(flags: list[bool]) -> list[dict]:
+    """Convert per-sample occlusion flags to arc segments with t in [0, 1]."""
+    n = len(flags)
+    arcs: list[dict] = []
+    start = 0
+    current = flags[0]
+    for i in range(1, n):
+        if flags[i] != current:
+            arcs.append({"t_start": start / n, "t_end": i / n, "occluded": current})
+            current = flags[i]
+            start = i
+    arcs.append({"t_start": start / n, "t_end": 1.0, "occluded": current})
+    return arcs
+
+
+def _compute_component_orbit(
+    component_mask: np.ndarray,
+    img_h: int,
+    img_w: int,
+    padding: float = 1.35,
+    n_samples: int = 360,
+) -> dict:
+    """Compute orbit ellipse and occlusion data for a single connected component.
+
+    Assumes component_mask is non-empty (caller's responsibility).
+    Returns a dict with normalized [0,1] coordinates.
+    """
+    ys, xs = np.where(component_mask > 0)
+    cx = float(np.mean(xs))
+    cy = float(np.mean(ys))
+    rx = max((float(xs.max()) - float(xs.min())) / 2.0 * padding, 1.0)
+    ry = max((float(ys.max()) - float(ys.min())) / 2.0 * padding, 1.0)
+
+    flags: list[bool] = []
+    for i in range(n_samples):
+        t = 2.0 * math.pi * i / n_samples
+        px = cx + rx * math.cos(t)
+        py = cy + ry * math.sin(t)
+        occluded = False
+        n_ray = 30
+        for j in range(1, n_ray):
+            lx = int(round(px + (cx - px) * j / n_ray))
+            ly = int(round(py + (cy - py) * j / n_ray))
+            if 0 <= ly < img_h and 0 <= lx < img_w and component_mask[ly, lx] > 0:
+                occluded = True
+                break
+        flags.append(occluded)
+
+    bezier_raw = _ellipse_to_bezier(cx / img_w, cy / img_h, rx / img_w, ry / img_h)
+    bezier = [
+        {k: {axis: round(v, 4) for axis, v in pt.items()} for k, pt in seg.items()}
+        for seg in bezier_raw
+    ]
+    arcs = [
+        {"t_start": round(a["t_start"], 4), "t_end": round(a["t_end"], 4), "occluded": a["occluded"]}
+        for a in _occlusion_to_arcs(flags)
+    ]
+
+    return {
+        "centroid": {"x": round(cx / img_w, 4), "y": round(cy / img_h, 4)},
+        "pixel_count": int(len(xs)),
+        "orbit_ellipse": {
+            "center": {"x": round(cx / img_w, 4), "y": round(cy / img_h, 4)},
+            "rx": round(rx / img_w, 4),
+            "ry": round(ry / img_h, 4),
+        },
+        "bezier_curves": bezier,
+        "arcs": arcs,
+    }
+
+
+def compute_band_orbits(
+    band_mask: np.ndarray,
+    img_h: int,
+    img_w: int,
+    min_component_pixels: int = 200,
+    padding: float = 1.35,
+    n_samples: int = 360,
+) -> list[dict]:
+    """Find connected components in band_mask and compute an orbit for each.
+
+    Components smaller than `min_component_pixels` are ignored (noise).
+    Returns a list of orbit dicts (one per component), sorted largest-first.
+    """
+    n_labels, label_map, stats, _ = cv2.connectedComponentsWithStats(
+        band_mask, connectivity=8
+    )
+    orbits = []
+    for label in range(1, n_labels):  # label 0 is background
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_component_pixels:
+            continue
+        component_mask = (label_map == label).astype(np.uint8) * 255
+        orbit = _compute_component_orbit(component_mask, img_h, img_w, padding, n_samples)
+        orbits.append(orbit)
+    orbits.sort(key=lambda o: o["pixel_count"], reverse=True)
+    return orbits
+
+
+# ---------------------------------------------------------------------------
+# Orbit visualization
+# ---------------------------------------------------------------------------
+
+def _random_saturated_color() -> tuple[int, int, int]:
+    """Return a random fully-saturated BGR color (S=1, V=1, random hue)."""
+    r, g, b = colorsys.hsv_to_rgb(random.random(), 1.0, 1.0)
+    return (int(b * 255), int(g * 255), int(r * 255))  # BGR for OpenCV
+
+
+def render_orbit_preview(
+    band_mask: np.ndarray,
+    orbits: list[dict],
+    img_h: int,
+    img_w: int,
+    line_thickness: int = 2,
+) -> np.ndarray:
+    """Render orbit ellipses over the alpha mask as an RGBA image.
+
+    The band mask is shown as a dim white layer; each component's orbit
+    ellipse and centroid dot are drawn in a unique random full-saturation color.
+    Returns H×W×4 uint8 RGBA array (fully opaque).
+    """
+    bgr = np.zeros((img_h, img_w, 3), dtype=np.uint8)
+    bgr[band_mask > 0] = (55, 55, 55)
+
+    for orbit in orbits:
+        color = _random_saturated_color()
+        ell = orbit["orbit_ellipse"]
+        cx_px = int(round(ell["center"]["x"] * img_w))
+        cy_px = int(round(ell["center"]["y"] * img_h))
+        rx_px = max(1, int(round(ell["rx"] * img_w)))
+        ry_px = max(1, int(round(ell["ry"] * img_h)))
+        cv2.ellipse(bgr, (cx_px, cy_px), (rx_px, ry_px), 0, 0, 360, color, line_thickness)
+        cv2.circle(bgr, (cx_px, cy_px), 4, color, -1)
+
+    rgba = np.zeros((img_h, img_w, 4), dtype=np.uint8)
+    rgba[:, :, :3] = bgr[:, :, ::-1]  # BGR → RGB
+    rgba[:, :, 3] = 255
+    return rgba
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -257,8 +441,8 @@ def main() -> None:
     model, transform = load_midas(device)
     depth, img_rgb = run_midas(args.image, model, transform, device)
 
-    print(f"Quantizing depth into {n_layers} band(s)...")
-    band_map = quantize_depth(depth, n_layers)
+    print(f"Quantizing depth into {n_layers + 1} band(s)...")
+    band_map = quantize_depth(depth, n_layers + 1)
 
     print("Detecting edges...")
     edges = compute_edges(img_rgb)
@@ -274,6 +458,30 @@ def main() -> None:
         covered = int(np.sum(mask > 0))
         total = mask.size
         print(f"  Wrote {out_path}  ({covered}/{total} px = {100*covered/total:.1f}% opaque)")
+
+    print("Computing orbit metadata...")
+    img_h, img_w = snapped.shape
+    for k in range(n_layers):
+        band_mask = ((snapped == k).astype(np.uint8) * 255)
+        components = compute_band_orbits(band_mask, img_h, img_w)
+        orbit_meta = {
+            "image_size": {"width": img_w, "height": img_h},
+            "layer_index": k + 1,
+            "t_param": "normalized_angle",
+            "note": "t=0 is rightmost point of ellipse, increases counter-clockwise. "
+                    "Coordinates normalized to [0,1] (x/width, y/height).",
+            "components": components,
+        }
+        orbit_path = f"{prefix}_layer_{k + 1}_orbits.json"
+        with open(orbit_path, "w") as f:
+            json.dump(orbit_meta, f, indent=2)
+
+        preview = render_orbit_preview(band_mask, components, img_h, img_w)
+        preview_path = f"{prefix}_layer_{k + 1}_orbits.png"
+        preview_img = Image.fromarray(preview, mode="RGBA")
+        os.makedirs(os.path.dirname(os.path.abspath(preview_path)), exist_ok=True)
+        preview_img.save(preview_path, format="PNG")
+        print(f"  Wrote {orbit_path} + {os.path.basename(preview_path)}  ({len(components)} component(s))")
 
     print("Done.")
 
